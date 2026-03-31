@@ -1,0 +1,5 @@
+﻿<!DOCTYPE html><html><head><meta charset="UTF-8"><title>OCR UVT</title></head>
+<body><h1>OCR Enhanced V4 - UVT</h1><p>API: <span id="api">loading...</span></p>
+<script>
+fetch('/api/health').then(r=>r.json()).then(d=>{document.getElementById('api').textContent=d.status;});
+</script></body></html>
