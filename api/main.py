@@ -7,7 +7,7 @@ from slowapi.errors import RateLimitExceeded
 import shutil, os, re, json, sqlite3, tempfile
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
@@ -23,11 +23,26 @@ DB_PATH = Path("ocr_history_api.db")
 UPLOAD_DIR = Path("temp_uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-DEFAULT_CONFIG = {"languages": ["ara", "fra", "eng"], "page_limit": 3, "dpi": 300, "patterns": [], "keywords": ["FACTURE", "REF", "DEVIS", "MANDAT"]}
+DEFAULT_CONFIG = {
+    "languages": ["ara", "fra", "eng"],
+    "page_limit": 3,
+    "dpi": 300,
+    "patterns": [
+        {"name": "Type", "field": "type", "regex": r"(أمر بالصرف|Facture|FACTURE|DEVIS|Mandat)", "fallback_regex": r"(facture|devis|mandat)", "priority": 100, "active": True},
+        {"name": "Numero", "field": "numero", "regex": r"(?:N[°]|Numero|Ref)\s*[:.]?\s*([A-Z0-9\-/]{3,20})", "fallback_regex": r"(?:#|n°)\s*([A-Z0-9\-/]{3,20})", "priority": 90, "active": True},
+        {"name": "Beneficiaire", "field": "beneficiaire", "regex": r"(?:Beneficiaire|Client)\s*[:\-]?\s*([^\n]{3,60})", "fallback_regex": r"(?:SARL|SA|SNC)\s+([A-Z][^\n]{2,40})", "priority": 80, "active": True},
+        {"name": "Annee", "field": "annee", "regex": r"\b(20(?:1[5-9]|2[0-9]))\b", "fallback_regex": r"[/\-](20\d{2})\b", "priority": 70, "active": True},
+        {"name": "Mois", "field": "mois", "regex": r"\b(0[1-9]|1[0-2])/(?:20)?[2-9][0-9]\b", "fallback_regex": r"(?:janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)", "priority": 60, "active": True},
+        {"name": "Montant", "field": "montant", "regex": r"(?:Montant|Total)\s*[:\-]?\s*([\d\s,.]+(?:DT|TND|€|\$)?)", "fallback_regex": r"\b(\d[\d\s,.]+)\s*(?:DT|TND)", "priority": 50, "active": True},
+        {"name": "Objet", "field": "objet", "regex": r"(?:Objet|Description)\s*[:\-]?\s*([^\n]{5,80})", "fallback_regex": r"(?:services|fournitures|formation)", "priority": 40, "active": True}
+    ],
+    "keywords": ["FACTURE", "REF", "DEVIS", "MANDAT", "COMMANDE"]
+}
+MONTHS_FR = {"janvier": "01", "février": "02", "mars": "03", "avril": "04", "mai": "05", "juin": "06", "juillet": "07", "août": "08", "septembre": "09", "octobre": "10", "novembre": "11", "décembre": "12"}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, source_name TEXT, renamed_name TEXT, extraction_json TEXT, success INTEGER, date_traitement TEXT, ai_used TEXT, processing_time_ms INTEGER)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, source_name TEXT, renamed_name TEXT, extraction_json TEXT, success INTEGER, date_traitement TEXT, ai_used TEXT, processing_time_ms INTEGER)""")
     conn.commit()
     return conn
 db_conn = init_db()
@@ -53,6 +68,19 @@ def perform_ocr(images: List[Image.Image], languages: List[str] = None) -> str:
 
 def extract_data(text: str) -> Dict[str, str]:
     norm = re.sub(r"[ \t\xA0\u200b]+", " ", text); data = {f: "UNKNOWN" for f in ["type", "numero", "beneficiaire", "annee", "mois", "client", "objet", "montant"]}
+    patterns = sorted(DEFAULT_CONFIG["patterns"], key=lambda x: x.get("priority", 0), reverse=True)
+    for p in patterns:
+        if not p.get("active"): continue
+        field = p.get("field")
+        if not field or data.get(field) != "UNKNOWN": continue
+        for key in ["regex", "fallback_regex"]:
+            rx = p.get(key, "")
+            if not rx: continue
+            try:
+                m = re.search(rx, norm, re.IGNORECASE | re.UNICODE | re.MULTILINE)
+                if m: val = (m.group(1) if m.groups() else m.group(0)).strip()
+                if m and len(val) >= 2: data[field] = val; break
+            except: pass
     if data["type"] == "UNKNOWN":
         for kw in DEFAULT_CONFIG["keywords"]:
             if kw.upper() in norm.upper(): data["type"] = kw.lower(); break
@@ -65,10 +93,12 @@ def extract_data(text: str) -> Dict[str, str]:
     if data["client"] == "UNKNOWN" and data["beneficiaire"] != "UNKNOWN": data["client"] = data["beneficiaire"]
     return data
 
-def generate_filename(template: str,  Dict[str, str]) -> str:
+# ✅ CORRECTION ICI : ajout du paramètre "data" avant le type
+def generate_filename(template: str, data: Dict[str, str]) -> str:
     try:
-        clean = {}; 
-        for k, v in data.items(): s = re.sub(r'[\\/*?:"<>|\r\t]', "", str(v).strip()); s = re.sub(r"\s+", "_", s)[:50]; clean[k] = s or "UNKNOWN"
+        clean = {}
+        for k, v in data.items():
+            s = re.sub(r'[\\/*?:"<>|\r\t]', "", str(v).strip()); s = re.sub(r"\s+", "_", s)[:50]; clean[k] = s or "UNKNOWN"
         name = template.format(**clean); name = re.sub(r"[^\w\-_.]", "_", name).lower(); name = re.sub(r"_+", "_", name)
         if not name.endswith(".pdf"): name += ".pdf"
         return name
@@ -106,22 +136,17 @@ async def process_document(file: UploadFile = File(...), template: str = Form("{
 @app.get("/api/history")
 @limiter.limit("30/minute")
 async def get_history(limit: int = 100, offset: int = 0):
-    cursor = db_conn.execute("SELECT * FROM history ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
-    rows = cursor.fetchall(); results = []
+    cursor = db_conn.execute("SELECT * FROM history ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)); rows = cursor.fetchall(); results = []
     for row in rows: results.append({"id": row[0], "source_name": row[1], "renamed_name": row[2], "extraction": json.loads(row[3]) if row[3] else None, "success": bool(row[4]), "date": row[5], "ai_used": row[6], "processing_time_ms": row[7]})
     return {"total": len(results), "results": results}
 
 @app.get("/api/stats")
 async def get_stats():
-    cursor = db_conn.execute("SELECT COUNT(*), SUM(success), AVG(processing_time_ms) FROM history")
-    row = cursor.fetchone()
+    cursor = db_conn.execute("SELECT COUNT(*), SUM(success), AVG(processing_time_ms) FROM history"); row = cursor.fetchone()
     return {"total_processed": row[0] or 0, "successful": row[1] or 0, "failed": (row[0] or 0) - (row[1] or 0), "avg_processing_time_ms": round(row[2], 2) if row[2] else 0}
 
 @app.delete("/api/history/clear")
 @limiter.limit("5/minute")
-async def clear_history():
-    db_conn.execute("DELETE FROM history"); db_conn.commit()
-    return {"message": "Historique effacé"}
+async def clear_history(): db_conn.execute("DELETE FROM history"); db_conn.commit(); return {"message": "Historique effacé"}
 
-if __name__ == "__main__":
-    import uvicorn; uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == "__main__": import uvicorn; uvicorn.run(app, host="0.0.0.0", port=8000)
