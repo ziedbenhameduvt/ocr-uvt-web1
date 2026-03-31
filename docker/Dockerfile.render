@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+# Installation des dépendances système
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    tesseract-ocr-ara \
+    tesseract-ocr-fra \
+    tesseract-ocr-eng \
+    poppler-utils \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgl1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+WORKDIR /app
+
+# Copie et installation des dépendances Python
+COPY api/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copie du code de l'API
+COPY api/ ./api/
+
+# Création du répertoire pour les fichiers temporaires
+RUN mkdir -p temp_uploads
+
+# Exposition du port (sera remplacé par $PORT sur Render)
+EXPOSE 8000
+
+# Commande de démarrage avec utilisation de variables d'environnement
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${UVICORN_WORKERS:-1}"]

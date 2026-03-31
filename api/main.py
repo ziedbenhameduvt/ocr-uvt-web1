@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+﻿from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -12,16 +12,62 @@ import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
 import fitz
+from dotenv import load_dotenv
+import logging
+
+# Configuration du logging
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Charger les variables d'environnement
+load_dotenv()
 
 app = FastAPI(title="OCR Enhanced API UVT", version="4.0.0")
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# Gestionnaire d'exceptions global
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Exception non gérée: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Une erreur interne s'est produite. Veuillez réessayer plus tard."}
+    )
+
+# Gestionnaire d'exceptions pour HTTPException
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning(f"HTTPException: {exc.status_code} - {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+
+# Configuration CORS basée sur les variables d'environnement
+frontend_url = os.getenv("FRONTEND_URL", "https://ocr-uvt-web.vercel.app")
+local_frontend_urls = os.getenv("LOCAL_FRONTEND_URLS", "http://localhost:3000,http://localhost:8080").split(",")
+allowed_origins = [frontend_url] + local_frontend_urls
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"]
+)
 
 DB_PATH = Path("ocr_history_api.db")
-UPLOAD_DIR = Path("temp_uploads")
+UPLOAD_DIR = Path(os.getenv("TEMP_UPLOADS_DIR", "temp_uploads"))
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Configuration de l'application
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "10485760"))  # 10MB par défaut
+OCR_TIMEOUT = int(os.getenv("OCR_TIMEOUT", "60"))  # 60 secondes par défaut
 
 DEFAULT_CONFIG = {
     "languages": ["ara", "fra", "eng"],
@@ -105,33 +151,201 @@ def generate_filename(template: str, data: Dict[str, str]) -> str:
     except: return f"doc_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
 
 @app.get("/")
-async def root(): return {"message": "OCR Enhanced API UVT v4.0", "status": "operational"}
+async def root(): 
+    logger.info("Accès à la racine de l'API")
+    return {"message": "OCR Enhanced API UVT v4.0", "status": "operational"}
 
 @app.get("/api/health")
-async def health_check(): return {"status": "ok", "version": "4.0.0", "ocr_engine": "tesseract", "languages": DEFAULT_CONFIG["languages"]}
+async def health_check():
+    """Endpoint de santé de base pour les health checks"""
+    return {
+        "status": "ok",
+        "version": "4.0.0",
+        "ocr_engine": "tesseract",
+        "languages": DEFAULT_CONFIG["languages"],
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/api/health/detailed")
+async def detailed_health_check():
+    """Endpoint de santé détaillé avec informations système"""
+    import psutil
+
+    # Informations sur le système
+    cpu_percent = psutil.cpu_percent(interval=1)
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+
+    # Vérification de la base de données
+    db_status = "ok"
+    try:
+        cursor = db_conn.execute("SELECT COUNT(*) FROM history")
+        row_count = cursor.fetchone()[0]
+    except Exception as e:
+        logger.error(f"Erreur lors de la vérification de la base de données: {str(e)}")
+        db_status = "error"
+        row_count = 0
+
+    # Vérification du répertoire temporaire
+    temp_status = "ok"
+    try:
+        if not os.path.exists(UPLOAD_DIR):
+            temp_status = "not_found"
+        elif not os.access(UPLOAD_DIR, os.W_OK):
+            temp_status = "not_writable"
+    except Exception as e:
+        logger.error(f"Erreur lors de la vérification du répertoire temporaire: {str(e)}")
+        temp_status = "error"
+
+    return {
+        "status": "ok",
+        "version": "4.0.0",
+        "ocr_engine": "tesseract",
+        "languages": DEFAULT_CONFIG["languages"],
+        "timestamp": datetime.now().isoformat(),
+        "system": {
+            "cpu_percent": cpu_percent,
+            "memory": {
+                "total": memory.total,
+                "available": memory.available,
+                "percent": memory.percent
+            },
+            "disk": {
+                "total": disk.total,
+                "free": disk.free,
+                "percent": disk.percent
+            }
+        },
+        "services": {
+            "database": {
+                "status": db_status,
+                "records_count": row_count
+            },
+            "temp_directory": {
+                "status": temp_status,
+                "path": str(UPLOAD_DIR)
+            }
+        }
+    }
+
+@app.get("/api/metrics")
+@limiter.limit("10/minute")
+async def get_metrics():
+    """Endpoint pour récupérer des métriques d'utilisation"""
+    cursor = db_conn.execute("""
+        SELECT 
+            COUNT(*) as total,
+            SUM(success) as successful,
+            SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failed,
+            AVG(processing_time_ms) as avg_processing_time,
+            MAX(processing_time_ms) as max_processing_time,
+            MIN(processing_time_ms) as min_processing_time
+        FROM history
+    """)
+    row = cursor.fetchone()
+
+    # Récupérer les traitements des dernières 24h
+    cursor = db_conn.execute("""
+        SELECT COUNT(*) 
+        FROM history 
+        WHERE date_traitement >= datetime('now', '-1 day')
+    """)
+    last_24h = cursor.fetchone()[0]
+
+    return {
+        "total_processed": row[0] or 0,
+        "successful": row[1] or 0,
+        "failed": row[2] or 0,
+        "avg_processing_time_ms": round(row[3], 2) if row[3] else 0,
+        "max_processing_time_ms": row[4] or 0,
+        "min_processing_time_ms": row[5] or 0,
+        "last_24h_processed": last_24h,
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.post("/api/ocr/process")
 @limiter.limit("20/minute")
 async def process_document(file: UploadFile = File(...), template: str = Form("{type}_{numero}_{beneficiaire}_{annee}.pdf"), use_ai: bool = Form(False)):
-    if not file.filename.endswith('.pdf'): raise HTTPException(400, "Seuls les fichiers PDF sont acceptés")
-    start_time = datetime.now(); temp_path = None
+    # Validation des inputs
+    if not file.filename:
+        logger.warning("Tentative de traitement sans fichier")
+        raise HTTPException(400, detail="Aucun fichier fourni")
+
+    if not file.filename.lower().endswith('.pdf'):
+        logger.warning(f"Tentative de traitement de fichier non-PDF: {file.filename}")
+        raise HTTPException(400, detail="Seuls les fichiers PDF sont acceptés")
+
+    # Validation de la taille du fichier
+    file.file.seek(0, 2)  # Seek to end
+    file_size = file.file.tell()
+    file.file.seek(0)  # Reset position
+
+    if file_size > MAX_FILE_SIZE:
+        max_size_mb = MAX_FILE_SIZE / (1024 * 1024)
+        logger.warning(f"Fichier trop volumineux: {file.filename} ({file_size} octets)")
+        raise HTTPException(413, detail=f"Le fichier dépasse la taille maximale de {max_size_mb}MB")
+
+    start_time = datetime.now()
+    temp_path = None
+
+    logger.info(f"Début du traitement du fichier: {file.filename} ({file_size} octets)")
+
     try:
         suffix = f"_{file.filename}"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=UPLOAD_DIR) as tmp: shutil.copyfileobj(file.file, tmp); temp_path = tmp.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=UPLOAD_DIR) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            temp_path = tmp.name
+
+        logger.debug(f"Fichier temporaire créé: {temp_path}")
+
         images = pdf_to_images(temp_path, dpi=DEFAULT_CONFIG["dpi"], page_limit=DEFAULT_CONFIG["page_limit"])
-        raw_text = perform_ocr(images); extracted_data = extract_data(raw_text)
+        logger.info(f"Extraction de {len(images)} pages du PDF")
+
+        raw_text = perform_ocr(images)
+        logger.debug(f"OCR terminé, {len(raw_text)} caractères extraits")
+
+        extracted_data = extract_data(raw_text)
+        logger.info(f"Données extraites: {json.dumps(extracted_data, ensure_ascii=False)}")
+
         new_filename = generate_filename(template, extracted_data)
         processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
-        db_conn.execute("INSERT INTO history (source_name, renamed_name, extraction_json, success, date_traitement, ai_used, processing_time_ms) VALUES (?, ?, ?, ?, ?, ?, ?)", (file.filename, new_filename, json.dumps(extracted_data, ensure_ascii=False), 1, datetime.now().isoformat(), "none" if not use_ai else "pending", processing_time))
+
+        db_conn.execute(
+            "INSERT INTO history (source_name, renamed_name, extraction_json, success, date_traitement, ai_used, processing_time_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (file.filename, new_filename, json.dumps(extracted_data, ensure_ascii=False), 1, datetime.now().isoformat(), "none" if not use_ai else "pending", processing_time)
+        )
         db_conn.commit()
-        return JSONResponse(content={"success": True, "original_name": file.filename, "proposed_name": new_filename, "extracted_data": extracted_data, "raw_text_preview": raw_text[:1000] + "..." if len(raw_text) > 1000 else raw_text, "processing_time_ms": processing_time, "pages_processed": len(images), "template_used": template})
+
+        logger.info(f"Traitement terminé avec succès en {processing_time}ms")
+
+        return JSONResponse(content={
+            "success": True,
+            "original_name": file.filename,
+            "proposed_name": new_filename,
+            "extracted_data": extracted_data,
+            "raw_text_preview": raw_text[:1000] + "..." if len(raw_text) > 1000 else raw_text,
+            "processing_time_ms": processing_time,
+            "pages_processed": len(images),
+            "template_used": template
+        })
+    except HTTPException:
+        # Re-raise HTTPException as is
+        raise
     except Exception as e:
-        db_conn.execute("INSERT INTO history (source_name, renamed_name, extraction_json, success, date_traitement, ai_used, processing_time_ms) VALUES (?, ?, ?, ?, ?, ?, ?)", (file.filename, None, json.dumps({"error": str(e)}), 0, datetime.now().isoformat(), "none", 0)); db_conn.commit()
-        raise HTTPException(500, f"Erreur de traitement: {str(e)}")
+        logger.error(f"Erreur lors du traitement du fichier {file.filename}: {str(e)}", exc_info=True)
+        db_conn.execute(
+            "INSERT INTO history (source_name, renamed_name, extraction_json, success, date_traitement, ai_used, processing_time_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (file.filename, None, json.dumps({"error": str(e)}), 0, datetime.now().isoformat(), "none", 0)
+        )
+        db_conn.commit()
+        raise HTTPException(500, detail=f"Erreur de traitement: {str(e)}")
     finally:
         if temp_path and os.path.exists(temp_path):
-            try: os.unlink(temp_path)
-            except: pass
+            try:
+                os.unlink(temp_path)
+                logger.debug(f"Fichier temporaire supprimé: {temp_path}")
+            except:
+                logger.warning(f"Impossible de supprimer le fichier temporaire: {temp_path}")
 
 @app.get("/api/history")
 @limiter.limit("30/minute")

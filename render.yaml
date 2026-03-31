@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: ocr-uvt-api
+    env: docker
+    plan: starter
+    dockerfilePath: ./docker/Dockerfile.render
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: PYTHONUNBUFFERED
+        value: 1
+      - key: DEFAULT_LANGUAGE
+        value: eng+fra+ara
+      - key: LOG_LEVEL
+        value: INFO
+      - key: FRONTEND_URL
+        value: https://ocr-uvt-web.vercel.app
+      - key: LOCAL_FRONTEND_URLS
+        value: http://localhost:3000,http://localhost:8080
+      - key: MAX_FILE_SIZE
+        value: 10485760
+      - key: UVICORN_WORKERS
+        value: 4
+      - key: OCR_TIMEOUT
+        value: 60
+    healthCheckPath: /api/health
+    autoDeploy: true
+    scaling:
+      min: 1
+      max: 5
+      targetMemoryPercent: 75
+      targetCPUPercent: 75
