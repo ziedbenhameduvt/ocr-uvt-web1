@@ -8,3 +8,4 @@ def health():
 @app.get("/")
 def root():
     return {"message": "OCR Enhanced API UVT"}
+
