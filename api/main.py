@@ -23,7 +23,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Charger les variables d'environnement
-load_dotenv()
+# Spécifier le chemin du fichier .env dans le répertoire parent
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 app = FastAPI(title="OCR Enhanced API UVT", version="4.0.0")
 limiter = Limiter(key_func=get_remote_address)
@@ -230,7 +232,7 @@ async def detailed_health_check():
 
 @app.get("/api/metrics")
 @limiter.limit("10/minute")
-async def get_metrics():
+async def get_metrics(request: Request):
     """Endpoint pour récupérer des métriques d'utilisation"""
     cursor = db_conn.execute("""
         SELECT 
@@ -265,7 +267,7 @@ async def get_metrics():
 
 @app.post("/api/ocr/process")
 @limiter.limit("20/minute")
-async def process_document(file: UploadFile = File(...), template: str = Form("{type}_{numero}_{beneficiaire}_{annee}.pdf"), use_ai: bool = Form(False)):
+async def process_document(request: Request, file: UploadFile = File(...), template: str = Form("{type}_{numero}_{beneficiaire}_{annee}.pdf"), use_ai: bool = Form(False)):
     # Validation des inputs
     if not file.filename:
         logger.warning("Tentative de traitement sans fichier")
@@ -349,18 +351,20 @@ async def process_document(file: UploadFile = File(...), template: str = Form("{
 
 @app.get("/api/history")
 @limiter.limit("30/minute")
-async def get_history(limit: int = 100, offset: int = 0):
+async def get_history(request: Request, limit: int = 100, offset: int = 0):
     cursor = db_conn.execute("SELECT * FROM history ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)); rows = cursor.fetchall(); results = []
     for row in rows: results.append({"id": row[0], "source_name": row[1], "renamed_name": row[2], "extraction": json.loads(row[3]) if row[3] else None, "success": bool(row[4]), "date": row[5], "ai_used": row[6], "processing_time_ms": row[7]})
     return {"total": len(results), "results": results}
 
 @app.get("/api/stats")
-async def get_stats():
+async def get_stats(request: Request):
     cursor = db_conn.execute("SELECT COUNT(*), SUM(success), AVG(processing_time_ms) FROM history"); row = cursor.fetchone()
     return {"total_processed": row[0] or 0, "successful": row[1] or 0, "failed": (row[0] or 0) - (row[1] or 0), "avg_processing_time_ms": round(row[2], 2) if row[2] else 0}
 
 @app.delete("/api/history/clear")
 @limiter.limit("5/minute")
-async def clear_history(): db_conn.execute("DELETE FROM history"); db_conn.commit(); return {"message": "Historique effacé"}
+async def clear_history(request: Request): db_conn.execute("DELETE FROM history"); db_conn.commit(); return {"message": "Historique effacé"}
+
+# Force reload - 2024-03-31
 
 if __name__ == "__main__": import uvicorn; uvicorn.run(app, host="0.0.0.0", port=8000)

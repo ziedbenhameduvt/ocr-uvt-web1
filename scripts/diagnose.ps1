@@ -107,7 +107,7 @@ try {
     $logFile = Join-Path $tempDir "backend-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 
     # Démarrer le backend avec redirection des logs
-    $backendProcess = Start-Process -FilePath "python" -ArgumentList "-m uvicorn api.main:app --host 0.0.0.0 --port 8000" -RedirectStandardOutput $logFile -RedirectStandardError $logFile -PassThru -WindowStyle Hidden
+    $backendProcess = Start-Process -FilePath "python" -ArgumentList "-m uvicorn api.main:app --host 0.0.0.0 --port 8000" -RedirectStandardOutput "$logFile.out" -RedirectStandardError "$logFile.err" -PassThru -WindowStyle Hidden
 
     Write-Host "✓ Backend démarré (PID: $($backendProcess.Id))" -ForegroundColor Green
     Write-Host "  Logs: $logFile" -ForegroundColor Cyan

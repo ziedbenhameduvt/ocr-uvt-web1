@@ -89,6 +89,14 @@ $frontendUrl = "http://localhost:$frontendPort"
 
 # Utiliser Python pour servir le frontend si disponible
 try {
+    # Vérifier si le port est déjà utilisé
+    $portInUse = Test-NetConnection -ComputerName localhost -Port $frontendPort -InformationLevel Quiet
+    if ($portInUse) {
+        Write-Host "⚠ Port $frontendPort déjà utilisé, tentative sur le port 8081..." -ForegroundColor Yellow
+        $frontendPort = 8081
+        $frontendUrl = "http://localhost:$frontendPort"
+    }
+
     $frontendProcess = Start-Process -FilePath "python" -ArgumentList "-m http.server $frontendPort --directory web" -PassThru -WindowStyle Hidden
     Write-Host "✓ Frontend démarré sur $frontendUrl" -ForegroundColor Green
 } catch {

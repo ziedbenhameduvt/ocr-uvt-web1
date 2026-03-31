@@ -12,7 +12,7 @@ Write-Host ""
 Write-Host "Étape 1: Récupération des URLs de déploiement..." -ForegroundColor Yellow
 
 # URL Render (Backend)
-$renderUrlFile = "scriptsender-url.txt"
+$renderUrlFile = Join-Path $PSScriptRoot "render-url.txt"
 if (Test-Path $renderUrlFile) {
     $renderUrl = Get-Content $renderUrlFile
     Write-Host "✓ URL Render détectée: $renderUrl" -ForegroundColor Green

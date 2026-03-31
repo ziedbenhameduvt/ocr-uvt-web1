@@ -83,7 +83,7 @@ if ($currentBranch -ne "main") {
 Write-Host ""
 Write-Host "Étape 4: Vérification du déploiement Render..." -ForegroundColor Yellow
 
-$renderUrlFile = "scriptsender-url.txt"
+$renderUrlFile = Join-Path $PSScriptRoot "render-url.txt"
 if (Test-Path $renderUrlFile) {
     $renderUrl = Get-Content $renderUrlFile
     Write-Host "✓ URL Render détectée: $renderUrl" -ForegroundColor Green
